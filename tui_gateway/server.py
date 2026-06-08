@@ -4053,12 +4053,16 @@ def _(rid, params: dict) -> dict:
             parent_session_id=old_key,
             cwd=_session_cwd(session),
         )
-        for msg in history:
-            db.append_message(
-                session_id=new_key,
-                role=msg.get("role", "user"),
-                content=msg.get("content"),
-            )
+        # Persist the full message history, not just role+content. A naive
+        # append loop that only forwarded role/content dropped tool_calls,
+        # tool_call_id and tool_name, so any branched agent session became
+        # corrupt once reloaded from the DB (the source of truth on resume):
+        # assistant tool calls lost their matching results and the provider
+        # rejected the next prompt with a 400. replace_messages serializes
+        # every field (tool linkage + reasoning) atomically — the same path
+        # /undo, /retry and /compress already rely on. The session is freshly
+        # created above, so the internal DELETE is a no-op here.
+        db.replace_messages(new_key, history)
         db.set_session_title(new_key, title)
     except Exception as e:
         return _err(rid, 5008, f"branch failed: {e}")

@@ -6096,3 +6096,83 @@ def test_sniff_image_ext_magic_and_filename():
     assert server._sniff_image_ext(b"unknown") == ".png"  # fallback
     # filename hint wins over magic bytes
     assert server._sniff_image_ext(b"\x89PNG", "photo.jpeg") == ".jpeg"
+
+
+def test_session_branch_persists_tool_calls_for_resume(monkeypatch, tmp_path):
+    """Branching a session that contains a tool call must persist the full
+    tool linkage to the DB, not just role+content.
+
+    Regression test: the branch handler used to write each message with only
+    role and content, so tool_calls/tool_call_id/tool_name were dropped. The
+    in-memory branch looked fine, but once the branch was reloaded from the DB
+    (close/reopen, then /resume), the assistant tool call had no matching tool
+    result and the next prompt was rejected by the provider. Here we branch a
+    session with a tool-call round-trip and assert the persisted transcript
+    still has those fields.
+    """
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "branch_state.db")
+
+    parent_key = "parent-session-key"
+    db.create_session(parent_key, source="tui", model="anthropic/claude-opus-4.6")
+
+    history = [
+        {"role": "user", "content": "what's the weather?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_abc123",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_abc123",
+            "tool_name": "get_weather",
+            "content": "sunny, 21C",
+        },
+        {"role": "assistant", "content": "It's sunny and 21C."},
+    ]
+
+    parent_sid = "parentsd"
+    server._sessions[parent_sid] = {
+        "session_key": parent_key,
+        "history": history,
+        "history_lock": threading.Lock(),
+        "cwd": str(tmp_path),
+        "cols": 80,
+    }
+
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "anthropic/claude-opus-4.6")
+    monkeypatch.setattr(server, "_new_session_key", lambda: "branch-session-key")
+    monkeypatch.setattr(server, "_make_agent", lambda *a, **k: object())
+    monkeypatch.setattr(server, "_init_session", lambda *a, **k: None)
+
+    try:
+        resp = server._methods["session.branch"](
+            "rid-1", {"session_id": parent_sid, "name": "my branch"}
+        )
+    finally:
+        server._sessions.pop(parent_sid, None)
+
+    assert "error" not in resp, resp
+    assert resp["result"]["parent"] == parent_key
+
+    # Reload the branch straight from the DB — the source of truth on resume.
+    persisted = db.get_messages_as_conversation("branch-session-key")
+    assert len(persisted) == len(history)
+
+    assistant_call = persisted[1]
+    assert assistant_call["tool_calls"][0]["id"] == "call_abc123"
+    assert assistant_call["tool_calls"][0]["function"]["name"] == "get_weather"
+
+    tool_result = persisted[2]
+    assert tool_result["tool_call_id"] == "call_abc123"
+    assert tool_result["tool_name"] == "get_weather"
+    assert tool_result["content"] == "sunny, 21C"
